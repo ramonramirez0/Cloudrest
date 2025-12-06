@@ -20,6 +20,15 @@ El sistema se conecta a **Arduino IoT Cloud** para ofrecer visualización en tie
 
 ---
 
+## 📸 Prototipo
+
+A continuación se muestra el resultado final del sistema wearable y su integración electrónica.
+
+![Vista del prototipo Cloudrest montado](ruta/a/tu/imagen.jpg)
+*(Nota: Reemplaza la ruta anterior con la ubicación real de tu imagen en el repositorio)*
+
+---
+
 ## 🚀 Características Técnicas
 
 * **🧠 Fusión de Sensores:** Integración simultánea de Oximetría (SpO2), Frecuencia Cardíaca, Audio (Ronquidos) y Esfuerzo Respiratorio.

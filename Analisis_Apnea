@@ -1,0 +1,298 @@
+/*
+   MONITOR TOTAL V6: DIAGNÓSTICO UNIFICADO
+   (Incluye Ronquidos y Respiración dentro de la misma lógica)
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+MAX30105 particleSensor;
+
+// ==========================================
+// 1. CONFIGURACIÓN OXÍMETRO
+// ==========================================
+const byte DATA_BUFFER_SIZE = 100;
+uint32_t irBuffer[DATA_BUFFER_SIZE];
+uint32_t redBuffer[DATA_BUFFER_SIZE];
+
+float dcValue = 0;
+const float DC_ALPHA = 0.995;
+float peakValue = 0;
+float valleyValue = 0;
+const float PEAK_DECAY = 0.99;
+const float VALLEY_RISE = 0.99;
+
+const long FINGER_THRESHOLD = 30000;
+const long MIN_BEAT_INTERVAL = 300;
+const long MAX_BEAT_INTERVAL = 2000;
+
+long lastBeatTime = 0;
+bool lastWasPeak = false;
+float currentBPM = 0;
+
+#define BPM_WINDOW 8
+float bpmHistory[BPM_WINDOW];
+byte bpmIndex = 0;
+
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
+
+long lastPrintTime = 0;
+bool fingerPresent = false;
+
+// ==========================================
+// 2. CONFIGURACIÓN AUDIO (Micrófono)
+// ==========================================
+const int pinMic = A0;
+const int pinLed = LED_BUILTIN;
+
+// Umbrales
+const int UMBRAL_RUIDO = 300;       
+const int UMBRAL_RONQUIDO = 780;  
+const unsigned long TIEMPO_MIN_RESPIRACION = 200; 
+const unsigned long INTERVALO_CONTEO = 10000; 
+const unsigned long VENTANA_REINICIO = 600000; 
+const int LIMITE_PARA_MEDICO = 10; 
+
+// Variables Lógica Audio
+unsigned long inicioEventoSonido = 0;
+unsigned long ultimoMomentoConteo = 0; 
+unsigned long inicioVentanaGeneral = 0;
+bool enEvento = false;           
+bool eventoContado = false;      
+int contadorPeligro = 0; 
+
+// Variables Visualización
+int amplitudActualMic = 0; 
+String mensajeDiagnostico = ""; 
+
+void setup() {
+  Serial.begin(115200); 
+  Wire.begin();
+  
+  // Espera para USB
+  while(!Serial && millis() < 5000); 
+
+  pinMode(pinLed, OUTPUT);
+  digitalWrite(pinLed, LOW);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println(F("MAX30105 no encontrado."));
+    while (1);
+  }
+
+  particleSensor.setup(60, 4, 2, 100, 411, 4096); 
+
+  Serial.println(F("--- MONITOR V6: TODO EN UNO ---"));
+  
+  ultimoMomentoConteo = millis();
+  inicioVentanaGeneral = millis();
+}
+
+void loop() {
+  // Bucle principal de muestreo (100 muestras)
+  for (byte i = 0; i < DATA_BUFFER_SIZE; i++) {
+    
+    while (particleSensor.available() == false) {
+       particleSensor.check();
+       chequearMic(); 
+    }
+    
+    uint32_t irRaw = particleSensor.getIR();
+    uint32_t redRaw = particleSensor.getRed();
+    particleSensor.nextSample();
+    
+    irBuffer[i] = irRaw;
+    redBuffer[i] = redRaw;
+    
+    // Detección de dedo
+    if (irRaw < FINGER_THRESHOLD) {
+      if (fingerPresent) {
+        fingerPresent = false;
+        mensajeDiagnostico = "⚪ Esperando dedo...";
+      }
+      currentBPM = 0; dcValue = 0; peakValue = 0; valleyValue = 0;
+    } else {
+      fingerPresent = true;
+      processSensor(irRaw); 
+    }
+
+    if (fingerPresent && i % 25 == 0) {
+       maxim_heart_rate_and_oxygen_saturation(
+         irBuffer, DATA_BUFFER_SIZE, 
+         redBuffer, &spo2, &validSPO2, 
+         &heartRate, &validHeartRate
+       );
+    }
+    
+    chequearMic(); 
+  }
+}
+
+// ==========================================
+// LOGICA DE DIAGNÓSTICO UNIFICADA
+// ==========================================
+void evaluarDiagnostico() {
+  
+  // 1. Estado por defecto (si no pasa nada malo ni ruidos)
+  mensajeDiagnostico = " Sueño Normal";
+
+  // 2. Jerarquía de problemas (EL ORDEN IMPORTA)
+  
+  // PRIORIDAD 1: Acumulación de Apneas (Lo más grave a largo plazo)
+  if (contadorPeligro >= LIMITE_PARA_MEDICO) {
+      mensajeDiagnostico = " CONSULTAR MÉDICO: Apneas";
+  } 
+  // PRIORIDAD 2: Apnea ocurriendo ahora con hipoxia
+  else if (contadorPeligro > 0 && validSPO2 == 1 && spo2 < 90) {
+      mensajeDiagnostico = " APNEA CRÍTICA: Baja O2";
+  } 
+  // PRIORIDAD 3: Pesadilla (Mucho ruido + Pulso acelerado)
+  else if (amplitudActualMic > UMBRAL_RUIDO && currentBPM > 110) {
+      mensajeDiagnostico = " PESADILLA";
+  } 
+  // PRIORIDAD 4: Taquicardia sin ruido
+  else if (currentBPM > 120 && fingerPresent) {
+      mensajeDiagnostico = " Taquicardia";
+  } 
+  // PRIORIDAD 5: Aviso de que hubo apnea reciente (pero oxigeno bien)
+  else if (contadorPeligro > 0) {
+      mensajeDiagnostico = " Posible Apnea";
+  }
+  // PRIORIDAD 6: Eventos de sonido normales (AQUI INTEGRAMOS LO QUE PEDISTE)
+  else if (amplitudActualMic > UMBRAL_RONQUIDO) {
+      mensajeDiagnostico = "Ronquido";
+  }
+  else if (amplitudActualMic > UMBRAL_RUIDO) {
+      mensajeDiagnostico = "Respirando";
+  }
+}
+
+// ==========================================
+// LOGICA DE MICROFONO
+// ==========================================
+void chequearMic() {
+  unsigned long tiempoActual = millis();
+  
+  int lectura = analogRead(pinMic);
+  amplitudActualMic = abs(lectura - 512) * 2; 
+  
+  // REINICIO VENTANA 10 MIN
+  if (tiempoActual - inicioVentanaGeneral >= VENTANA_REINICIO) {
+    contadorPeligro = 0; 
+    inicioVentanaGeneral = tiempoActual;
+  }
+
+  // DETECCIÓN DE EVENTOS (RUIDO)
+  if (amplitudActualMic > UMBRAL_RUIDO) {
+    ultimoMomentoConteo = tiempoActual; // Reset contador silencio
+    
+    if (!enEvento) {
+      inicioEventoSonido = tiempoActual;
+      enEvento = true;
+      eventoContado = false;
+    }
+
+    if ((tiempoActual - inicioEventoSonido >= TIEMPO_MIN_RESPIRACION) && !eventoContado) {
+      eventoContado = true;
+    }
+
+  } else {
+    // SILENCIO
+    enEvento = false;
+    
+    // Si hay silencio por más de 10 segundos
+    if (tiempoActual - ultimoMomentoConteo >= INTERVALO_CONTEO) {
+      contadorPeligro++; 
+      ultimoMomentoConteo = tiempoActual; 
+      Serial.print(F("\n*** APNEA CONTADA (Total: "));
+      Serial.print(contadorPeligro);
+      Serial.println(F(") ***\n"));
+    }
+  }
+}
+
+// ==========================================
+// VISUALIZACIÓN
+// ==========================================
+void processSensor(uint32_t irRaw) {
+  if (dcValue == 0) { dcValue = irRaw; return; }
+  
+  dcValue = dcValue * DC_ALPHA + irRaw * (1.0 - DC_ALPHA);
+  float acSignal = irRaw - dcValue;
+  
+  if (peakValue == 0 && valleyValue == 0) { peakValue = acSignal; valleyValue = acSignal; }
+  
+  if (acSignal > peakValue) peakValue = acSignal;
+  else peakValue = peakValue * PEAK_DECAY;
+  
+  if (acSignal < valleyValue) valleyValue = acSignal;
+  else valleyValue = valleyValue + (0 - valleyValue) * (1.0 - VALLEY_RISE);
+  
+  float threshold = valleyValue + (peakValue - valleyValue) * 0.6;
+  
+  bool beatDetected = false;
+  long currentTime = millis();
+  
+  if (acSignal > threshold && !lastWasPeak) {
+    if (currentTime - lastBeatTime > MIN_BEAT_INTERVAL && currentTime - lastBeatTime < MAX_BEAT_INTERVAL) {
+      float instantBPM = 60000.0 / (currentTime - lastBeatTime);
+      if (instantBPM >= 40 && instantBPM <= 180) {
+        addBPM(instantBPM);
+        beatDetected = true;
+      }
+    }
+    lastBeatTime = currentTime;
+    lastWasPeak = true;
+  } else if (acSignal < threshold * 0.8) {
+    lastWasPeak = false;
+  }
+  
+  // Imprimir siempre para ver el gráfico
+  if (beatDetected || millis() - lastPrintTime > 100) {
+    evaluarDiagnostico(); // Ejecutamos la lógica antes de imprimir
+    printInfo(beatDetected);
+  }
+}
+
+void addBPM(float val) {
+  bpmHistory[bpmIndex] = val;
+  bpmIndex = (bpmIndex + 1) % BPM_WINDOW;
+  float sum = 0; byte count = 0;
+  for(byte i = 0; i < BPM_WINDOW; i++) {
+    if(bpmHistory[i] > 20) { sum += bpmHistory[i]; count++; }
+  }
+  if (count > 0) {
+    float newBPM = sum / count;
+    if (currentBPM > 0) currentBPM = currentBPM * 0.7 + newBPM * 0.3;
+    else currentBPM = newBPM;
+  }
+}
+
+void printInfo(bool beat) {
+  if (beat) Serial.print(F("💓"));
+  else Serial.print(F("_"));
+
+  Serial.print(F(" BPM:"));
+  Serial.print(currentBPM, 0);
+  
+  Serial.print(F(" O2:"));
+  if (validSPO2 && spo2 > 60 && spo2 <= 100) {
+    Serial.print(spo2); Serial.print(F("%"));
+  } else {
+    Serial.print(F("--"));
+  }
+
+  Serial.print(F(" | Mic:"));
+  Serial.print(amplitudActualMic);
+
+  // AQUI APARECE EL MENSAJE UNIFICADO
+  Serial.print(F(" -> [ "));
+  Serial.print(mensajeDiagnostico);
+  Serial.println(F(" ]"));
+  
+  lastPrintTime = millis();
+}

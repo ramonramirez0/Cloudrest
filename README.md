@@ -24,7 +24,7 @@ El sistema se conecta a **Arduino IoT Cloud** para ofrecer visualización en tie
 
 A continuación se muestra el resultado final del sistema wearable y su integración electrónica.
 
-![Vista del prototipo Cloudrest montado](Prototipo_Integrado.jpg)
+![Vista del prototipo Cloudrest montado](Prototipo_Integrado.png)
 *(Nota: Reemplaza la ruta anterior con la ubicación real de tu imagen en el repositorio)*
 
 ---
